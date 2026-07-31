@@ -52,7 +52,7 @@ Open `https://your-worker.workers.dev/admin` in a browser. The panel asks for yo
 - Add and delete keys
 - Force a usage sync via the **Sync usage now** button
 
-![Admin panel](https://github.com/user-attachments/assets/525823a2-75bc-4d49-acd1-ec87338ee096)
+![Admin panel](https://github.com/user-attachments/assets/1c7b9e03-41e7-4396-84db-40b5d1a35f64)
 
 ### Key Management
 

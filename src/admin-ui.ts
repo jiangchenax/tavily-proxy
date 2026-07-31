@@ -3,7 +3,8 @@
  *
  * The browser cannot set a custom x-api-key header on page navigation, so the
  * page itself is public and prompts for the AUTH_KEY. The key is kept in
- * sessionStorage and attached to every API request via a fetch wrapper.
+ * localStorage (survives refresh / browser restart) and attached to every API
+ * request via a fetch wrapper. A Logout button clears it.
  */
 
 const CSS = `
@@ -24,8 +25,9 @@ const CSS = `
     background: var(--bg); color: var(--text);
   }
   .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 24px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .sub { color: var(--muted); font-size: 13px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   input[type=text], input[type=password] {
@@ -66,8 +68,13 @@ const HTML = `<!doctype html>
 </head>
 <body>
 <div class="wrap">
-  <h1>tavily-proxy Admin</h1>
-  <div class="sub">MCP proxy for Tavily with an API key pool</div>
+  <div class="header">
+    <div>
+      <h1>tavily-proxy Admin</h1>
+      <div class="sub">MCP proxy for Tavily with an API key pool</div>
+    </div>
+    <button id="logoutBtn" class="ghost" style="display:none" onclick="logout()">Logout</button>
+  </div>
 
   <div class="card" id="loginCard">
     <form class="row" onsubmit="login(); return false;">
@@ -142,7 +149,7 @@ function creditBadge(key) {
 
 function api(path, options) {
   const headers = Object.assign({}, (options && options.headers) || {}, {
-    "x-api-key": sessionStorage.getItem(AUTH_KEY) || "",
+    "x-api-key": localStorage.getItem(AUTH_KEY) || "",
   });
   if (options && options.body) {
     headers["Content-Type"] = "application/json";
@@ -155,6 +162,7 @@ async function handle(res) {
     document.getElementById("loginCard").style.display = "";
     document.getElementById("addCard").style.display = "none";
     document.getElementById("listCard").style.display = "none";
+    document.getElementById("logoutBtn").style.display = "none";
     setMsg("loginMsg", "Unauthorized: wrong AUTH_KEY", true);
     throw new Error("unauthorized");
   }
@@ -174,10 +182,30 @@ function setMsg(id, text, isErr) {
 function login() {
   const value = document.getElementById("authInput").value.trim();
   if (!value) return;
-  sessionStorage.setItem(AUTH_KEY, value);
+  localStorage.setItem(AUTH_KEY, value);
   document.getElementById("loginCard").style.display = "none";
+  document.getElementById("logoutBtn").style.display = "";
   loadKeys();
 }
+
+function logout() {
+  localStorage.removeItem(AUTH_KEY);
+  document.getElementById("loginCard").style.display = "";
+  document.getElementById("addCard").style.display = "none";
+  document.getElementById("listCard").style.display = "none";
+  document.getElementById("logoutBtn").style.display = "none";
+  document.getElementById("authInput").value = "";
+  setMsg("loginMsg", "", false);
+}
+
+function init() {
+  if (localStorage.getItem(AUTH_KEY)) {
+    document.getElementById("loginCard").style.display = "none";
+    document.getElementById("logoutBtn").style.display = "";
+    loadKeys();
+  }
+}
+init();
 
 function addKey() {
   const value = document.getElementById("keyInput").value.trim();
