@@ -55,22 +55,6 @@ const CSS = `
   .toolbar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
 `;
 
-function timeAgo(secs: number): string {
-  if (!secs) return "-";
-  const diff = Math.floor(Date.now() / 1000) - secs;
-  if (diff < 60) return diff + "s ago";
-  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
-  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
-  return Math.floor(diff / 86400) + "d ago";
-}
-
-function statusBadge(key: any): string {
-  if (key.cooldownUntil > Math.floor(Date.now() / 1000)) {
-    return '<span class="badge cooling">cooling</span>';
-  }
-  return '<span class="badge ' + key.status + '">' + key.status + "</span>";
-}
-
 const HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -121,6 +105,22 @@ const HTML = `<!doctype html>
 
 <script>
 const AUTH_KEY = "tavilyProxyAuthKey";
+
+function timeAgo(secs) {
+  if (!secs) return "-";
+  var diff = Math.floor(Date.now() / 1000) - secs;
+  if (diff < 60) return diff + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
+function statusBadge(key) {
+  if (key.cooldownUntil > Math.floor(Date.now() / 1000)) {
+    return '<span class="badge cooling">cooling</span>';
+  }
+  return '<span class="badge ' + key.status + '">' + key.status + "</span>";
+}
 
 function api(path, options) {
   const headers = Object.assign({}, (options && options.headers) || {}, {
