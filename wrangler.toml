@@ -9,7 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [[kv_namespaces]]
 binding = "KV"
-id = "8c9031329f264adb85952b069e2b5cce"
+id = "11d3afd2a78340ac930675db6a910f32"
 preview_id = "local-dev-kv"
 
 [observability]
