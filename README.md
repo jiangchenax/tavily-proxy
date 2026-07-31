@@ -6,21 +6,24 @@ A Cloudflare Worker that acts as an MCP (Model Context Protocol) proxy for the [
 
 - **MCP Server** — Streamable HTTP transport at `POST /mcp`, compatible with any MCP client
 - **4 Tavily Tools** — `tavily-search`, `tavily-extract`, `tavily-crawl`, `tavily-map`
-- **API Key Pool** — Multiple Tavily API keys stored in Cloudflare KV; each request picks the key with the highest remaining credit
-- **Key Management API** — HTTP endpoints to add/delete keys and query their status
-- **Auth Protected** — All endpoints (except health check) require an `x-api-key` header
+- **API Key Pool** — Multiple Tavily API keys stored in Cloudflare KV; each request picks the least-recently-used healthy key
+- **Health-aware routing** — Tavily 432 (quota exhausted) keys are skipped until the next UTC month; 429 rate limits apply a transient cooldown; 401/403 keys are invalidated
+- **Key Management API + Admin Panel** — HTTP endpoints plus an embedded web panel (`GET /admin`) to add/delete keys and monitor usage
+- **Auth Protected** — All endpoints except `GET /` and `GET /admin` require an `x-api-key` header
 
 ## Endpoints
 
-| Method   | Path        | Description                                      |
-|----------|-------------|--------------------------------------------------|
-| `POST`   | `/mcp`      | MCP Streamable HTTP endpoint (tool calls)        |
-| `POST`   | `/api/keys` | Add a Tavily API key to the pool                 |
-| `DELETE` | `/api/keys` | Remove a Tavily API key from the pool            |
-| `GET`    | `/api/keys` | List all keys and their remaining credits        |
-| `GET`    | `/`         | Health check (no auth required)                  |
+| Method   | Path            | Description                                               |
+|----------|-----------------|-----------------------------------------------------------|
+| `POST`   | `/mcp`          | MCP Streamable HTTP endpoint (tool calls)                 |
+| `POST`   | `/api/keys`     | Add a Tavily API key to the pool                          |
+| `DELETE` | `/api/keys`     | Remove a Tavily API key from the pool                     |
+| `GET`    | `/api/keys`     | List all keys and their status (auto-triggers lazy sync)  |
+| `POST`   | `/api/keys/sync`| Force a `/usage` sync for all keys                        |
+| `GET`    | `/admin`        | Admin panel (opens without auth; prompts for AUTH_KEY)    |
+| `GET`    | `/`             | Health check (no auth required)                           |
 
-All endpoints except `GET /` require the `x-api-key` header matching your configured `AUTH_KEY`.
+All endpoints except `GET /` and `GET /admin` require the `x-api-key` header matching your configured `AUTH_KEY`.
 
 ## Setup
 
@@ -96,6 +99,14 @@ With `mcp-remote` (for clients like Cursor, Claude Desktop, etc.):
 }
 ```
 
+### Admin Panel
+
+Open `https://your-worker.workers.dev/admin` in a browser. The panel asks for your `AUTH_KEY` (kept in the browser's `sessionStorage`), then lets you:
+
+- List all keys — masked key, status (`active` / `exhausted` / cooling), remaining/limit credit, last-used and last-synced times
+- Add and delete keys
+- Force a usage sync via the **Sync usage now** button
+
 ### Key Management
 
 ```bash
@@ -109,6 +120,10 @@ curl -X POST https://your-worker.workers.dev/api/keys \
 curl https://your-worker.workers.dev/api/keys \
   -H "x-api-key: your-auth-key"
 
+# Force a usage sync for all keys
+curl -X POST https://your-worker.workers.dev/api/keys/sync \
+  -H "x-api-key: your-auth-key"
+
 # Delete a key
 curl -X DELETE https://your-worker.workers.dev/api/keys \
   -H "Content-Type: application/json" \
@@ -118,11 +133,20 @@ curl -X DELETE https://your-worker.workers.dev/api/keys \
 
 ## How the Key Pool Works
 
-1. When a tool is called, `KV.list()` retrieves all stored API keys
-2. The key with the **largest remaining credit** is selected
-3. The request is proxied to `api.tavily.com` using that key
-4. After the call, the estimated credit cost is deducted locally in KV
-5. When a key is added via `/api/keys`, its real remaining credit is fetched from Tavily's `/usage` endpoint
+The design follows [tavily-hikari](https://github.com/IvanLi-CN/tavily-hikari): the request hot path does **not** estimate or deduct credits locally. Key health is driven by real upstream signals:
+
+1. Each request picks the **least-recently-used healthy key** (LRU).
+2. **HTTP 432** (Tavily quota exhausted) → the key is marked `exhausted` and skipped for the rest of the current UTC month; it is restored automatically at the next monthly reset.
+3. **HTTP 429** (rate limited) → the key is cooled down for the `Retry-After` window (fallback 60s) and the next key is tried.
+4. **HTTP 401/403** → the key is marked `exhausted` and retried against the next key.
+5. Remaining credit is only a **display field**, synced from Tavily's `/usage` endpoint in the background:
+   - `POST /api/keys` queries usage when adding a key.
+   - `GET /api/keys` returns cached values and kicks off a background sync when they are stale (>30 min).
+   - `POST /api/keys/sync` forces a full sync.
+
+### Workers Free Plan Note
+
+Cron triggers do **not** fire on the Workers Free plan. The `scheduled` handler is still included, but on Free you should rely on the lazy sync built into `GET /api/keys` and the admin panel's **Sync usage now** button. Uncomment the `[triggers]` block in `wrangler.toml` to enable hourly cron syncs after upgrading to a paid plan.
 
 ## License
 
