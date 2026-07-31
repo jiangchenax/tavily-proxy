@@ -23,7 +23,10 @@ async function tavilyRequest(
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Tavily API error ${res.status}: ${text}`);
+    // Include Retry-After in the message so callers can schedule a cooldown.
+    const retryAfter = res.headers.get("retry-after");
+    const suffix = retryAfter ? ` (retry-after: ${retryAfter})` : "";
+    throw new Error(`Tavily API error ${res.status}${suffix}: ${text}`);
   }
 
   return res.json();
@@ -43,4 +46,28 @@ export async function crawl(apiKey: string, params: Record<string, unknown>) {
 
 export async function map(apiKey: string, params: Record<string, unknown>) {
   return tavilyRequest("/map", "POST", apiKey, params);
+}
+
+/**
+ * Query the Tavily /usage endpoint. Returns remaining credits for a key.
+ * Throws `Tavily API error <status>: <body>` on non-2xx responses.
+ */
+export async function usage(apiKey: string): Promise<{ limit: number; remaining: number }> {
+  const res = await fetch(`${TAVILY_BASE}/usage`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Tavily API error ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as {
+    key: { usage: number; limit: number | null };
+    account: { plan_limit: number; plan_usage: number };
+  };
+
+  const limit = data.key.limit ?? data.account.plan_limit ?? 0;
+  const usage = data.key.usage;
+  return { limit, remaining: Math.max(0, limit - usage) };
 }

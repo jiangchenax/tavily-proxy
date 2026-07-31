@@ -4,21 +4,54 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { toFetchResponse, toReqRes } from "fetch-to-node";
 import { z } from "zod";
 import * as tavilyClient from "./tavily-client.js";
-import { pickBestKey, addKey, deleteKey, listKeys, deductCredit, maybeSyncKeyUsage, invalidateKey } from "./key-pool.js";
+import {
+  pickBestKey,
+  addKey,
+  deleteKey,
+  listKeys,
+  markExhausted,
+  setCooldown,
+  syncAllUsage,
+  maskKey,
+} from "./key-pool.js";
+import { ADMIN_HTML } from "./admin-ui.js";
 
 type Env = {
   KV: KVNamespace;
   AUTH_KEY: string;
 };
 
+/** Consider a key's credit display stale after this many seconds. */
+const SYNC_STALE_SECS = 30 * 60;
+/** Fallback cooldown when Retry-After is missing/not parseable. */
+const DEFAULT_COOLDOWN_SECS = 60;
+/** Cap a single 429 cooldown so a long Retry-After cannot sideline a key forever. */
+const MAX_COOLDOWN_SECS = 3600;
+
+function nowSecs(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function parseRetryAfter(message: string): number {
+  const match = /retry-after:\s*(\d+)/.exec(message);
+  if (match) {
+    const secs = Number(match[1]);
+    if (Number.isFinite(secs) && secs >= 0) {
+      return Math.min(MAX_COOLDOWN_SECS, Math.round(secs));
+    }
+  }
+  return DEFAULT_COOLDOWN_SECS;
+}
+
 const app = new Hono<{ Bindings: Env }>();
 
 // ---------------------------------------------------------------------------
-// Auth middleware: require x-api-key header on all routes except GET /
+// Auth middleware: require x-api-key header on all routes except the pages a
+// browser must be able to open directly (GET / health check, GET /admin panel).
 // ---------------------------------------------------------------------------
 app.use("*", async (c, next) => {
-  // Allow health check without auth
-  if (c.req.path === "/" && c.req.method === "GET") {
+  const isPublicPage = c.req.method === "GET" && (c.req.path === "/" || c.req.path === "/admin");
+  if (isPublicPage) {
     return next();
   }
 
@@ -31,15 +64,16 @@ app.use("*", async (c, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Helper: call a Tavily tool with automatic key fallback on auth errors.
-// If the selected key returns a 4xx auth error, invalidate it and retry
-// with the next best key. Repeats until success or no keys remain.
+// Helper: call a Tavily tool with automatic key fallback.
+// Key health is driven by real upstream signals:
+//   432 -> quota exhausted, mark exhausted (skipped until next UTC month)
+//   429 -> rate limited, cool down per Retry-After, try the next key
+//   401/403 -> invalid key, mark exhausted
 // ---------------------------------------------------------------------------
 async function withKeyFallback(
   kv: KVNamespace,
   toolName: string,
-  fn: (apiKey: string) => Promise<unknown>,
-  postSuccess: (apiKey: string) => Promise<void>
+  fn: (apiKey: string) => Promise<unknown>
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   const triedKeys = new Set<string>();
 
@@ -52,21 +86,35 @@ async function withKeyFallback(
       };
     }
     triedKeys.add(apiKey);
-    console.log(`[MCP] ${toolName} using key: ${apiKey.substring(0, 13)}...`);
+    console.log(`[MCP] ${toolName} using key: ${maskKey(apiKey)}`);
+
     try {
       const result = await fn(apiKey);
-      await postSuccess(apiKey);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      // Invalidate key and retry on auth errors
-      if (/Tavily API error (401|403)/.test(message)) {
-        console.error(`[MCP] ${toolName} key ${apiKey.substring(0, 13)}... got auth error, invalidating and retrying`);
-        await invalidateKey(kv, apiKey);
+
+      if (/Tavily API error 432/.test(message)) {
+        console.error(`[MCP] ${toolName} key ${maskKey(apiKey)} quota exhausted (432), marking exhausted`);
+        await markExhausted(kv, apiKey);
         continue;
       }
+
+      if (/Tavily API error 429/.test(message)) {
+        const cooldown = parseRetryAfter(message);
+        console.error(`[MCP] ${toolName} key ${maskKey(apiKey)} rate limited (429), cooling for ${cooldown}s`);
+        await setCooldown(kv, apiKey, nowSecs() + cooldown);
+        continue;
+      }
+
+      if (/Tavily API error (401|403)/.test(message)) {
+        console.error(`[MCP] ${toolName} key ${maskKey(apiKey)} auth error, marking exhausted`);
+        await markExhausted(kv, apiKey);
+        continue;
+      }
+
       return {
         content: [{ type: "text", text: `Error calling Tavily ${toolName}: ${message}` }],
         isError: true,
@@ -95,7 +143,7 @@ function createMcpServer(kv: KVNamespace) {
         .optional()
         .default("basic")
         .describe(
-          "Controls the latency vs. relevance tradeoff. 'advanced': highest relevance, increased latency (2 credits). 'basic': balanced (1 credit). 'fast': lower latency (1 credit). 'ultra-fast': minimum latency (1 credit)."
+          "Controls the latency vs. relevance tradeoff. 'advanced': highest relevance, increased latency. 'basic': balanced. 'fast': lower latency. 'ultra-fast': minimum latency."
         ),
       topic: z
         .enum(["general", "news", "finance"])
@@ -154,16 +202,8 @@ function createMcpServer(kv: KVNamespace) {
         .optional()
         .describe("Boost results from a specific country. Only for 'general' topic."),
     },
-    async (params) => {
-      const cost = params.search_depth === "advanced" ? 2 : 1;
-      return withKeyFallback(kv, "tavily-search",
-        (apiKey) => tavilyClient.search(apiKey, params),
-        async (apiKey) => {
-          await deductCredit(kv, apiKey, cost);
-          await maybeSyncKeyUsage(kv, apiKey);
-        }
-      );
-    }
+    async (params) =>
+      withKeyFallback(kv, "tavily-search", (apiKey) => tavilyClient.search(apiKey, params))
   );
 
   // -- tavily-extract -------------------------------------------------------
@@ -182,7 +222,7 @@ function createMcpServer(kv: KVNamespace) {
         .enum(["basic", "advanced"])
         .optional()
         .default("basic")
-        .describe("Depth of extraction. 'advanced' retrieves more data including tables (2 credits/5 URLs vs 1 credit/5 URLs)."),
+        .describe("Depth of extraction. 'advanced' retrieves more data including tables."),
       include_images: z
         .boolean()
         .optional()
@@ -201,18 +241,8 @@ function createMcpServer(kv: KVNamespace) {
         .optional()
         .describe("Max relevant chunks per source (1-5). Only when 'query' is provided."),
     },
-    async (params) => {
-      const urlCount = Array.isArray(params.urls) ? params.urls.length : 1;
-      const costPer5 = params.extract_depth === "advanced" ? 2 : 1;
-      const cost = Math.max(1, Math.ceil(urlCount / 5) * costPer5);
-      return withKeyFallback(kv, "tavily-extract",
-        (apiKey) => tavilyClient.extract(apiKey, params),
-        async (apiKey) => {
-          await deductCredit(kv, apiKey, cost);
-          await maybeSyncKeyUsage(kv, apiKey);
-        }
-      );
-    }
+    async (params) =>
+      withKeyFallback(kv, "tavily-extract", (apiKey) => tavilyClient.extract(apiKey, params))
   );
 
   // -- tavily-crawl ---------------------------------------------------------
@@ -224,7 +254,7 @@ function createMcpServer(kv: KVNamespace) {
       instructions: z
         .string()
         .optional()
-        .describe("Natural language instructions for the crawler. Increases cost to 2 credits/10 pages."),
+        .describe("Natural language instructions for the crawler."),
       max_depth: z
         .number()
         .int()
@@ -292,15 +322,8 @@ function createMcpServer(kv: KVNamespace) {
         .optional()
         .describe("Max relevant chunks per source (1-5). Only when 'instructions' provided."),
     },
-    async (params) => {
-      return withKeyFallback(kv, "tavily-crawl",
-        (apiKey) => tavilyClient.crawl(apiKey, params),
-        async (apiKey) => {
-          await deductCredit(kv, apiKey, 2);
-          await maybeSyncKeyUsage(kv, apiKey);
-        }
-      );
-    }
+    async (params) =>
+      withKeyFallback(kv, "tavily-crawl", (apiKey) => tavilyClient.crawl(apiKey, params))
   );
 
   // -- tavily-map -----------------------------------------------------------
@@ -312,7 +335,7 @@ function createMcpServer(kv: KVNamespace) {
       instructions: z
         .string()
         .optional()
-        .describe("Natural language instructions for the mapper. Increases cost to 2 credits/10 pages."),
+        .describe("Natural language instructions for the mapper."),
       max_depth: z
         .number()
         .int()
@@ -358,15 +381,8 @@ function createMcpServer(kv: KVNamespace) {
         .default(true)
         .describe("Whether to include external domain links."),
     },
-    async (params) => {
-      return withKeyFallback(kv, "tavily-map",
-        (apiKey) => tavilyClient.map(apiKey, params),
-        async (apiKey) => {
-          await deductCredit(kv, apiKey, 1);
-          await maybeSyncKeyUsage(kv, apiKey);
-        }
-      );
-    }
+    async (params) =>
+      withKeyFallback(kv, "tavily-map", (apiKey) => tavilyClient.map(apiKey, params))
   );
 
   return server;
@@ -442,17 +458,41 @@ app.delete("/api/keys", async (c) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// HTTP API: Query all keys status
-// ---------------------------------------------------------------------------
+// Force a background /usage sync for all keys, then return the updated list.
+app.post("/api/keys/sync", async (c) => {
+  try {
+    const synced = await syncAllUsage(c.env.KV);
+    const keys = await listKeys(c.env.KV);
+    return c.json({ success: true, synced, keys });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return c.json({ error: message }, 500);
+  }
+});
+
+// List all keys with cached credit. If the cached values are stale, kick off a
+// background sync via waitUntil so the next refresh is fresh (Free plan has no
+// cron triggers, so this lazy path is the primary sync mechanism).
 app.get("/api/keys", async (c) => {
   try {
     const keys = await listKeys(c.env.KV);
+    const now = nowSecs();
+    const stale = keys.some((k) => now - k.creditSyncedAt > SYNC_STALE_SECS);
+    if (stale) {
+      c.executionCtx.waitUntil(syncAllUsage(c.env.KV));
+    }
     return c.json({ keys });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return c.json({ error: message }, 500);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Admin panel (embedded single-file HTML, no build step)
+// ---------------------------------------------------------------------------
+app.get("/admin", (c) => {
+  return c.html(ADMIN_HTML);
 });
 
 // ---------------------------------------------------------------------------
@@ -467,8 +507,28 @@ app.get("/", (c) => {
       addKey: "POST /api/keys { apiKey: string }",
       deleteKey: "DELETE /api/keys { apiKey: string }",
       listKeys: "GET /api/keys",
+      syncKeys: "POST /api/keys/sync",
+      adminPanel: "GET /admin",
     },
   });
 });
 
-export default app;
+// ---------------------------------------------------------------------------
+// Scheduled handler: background /usage sync.
+// NOTE: cron triggers do NOT fire on the Workers Free plan. This runs when you
+// upgrade to a paid plan and enable the cron in wrangler.toml. On Free, usage
+// is kept fresh by the lazy sync in GET /api/keys and POST /api/keys/sync.
+// ---------------------------------------------------------------------------
+async function scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  try {
+    const count = await syncAllUsage(env.KV);
+    console.log(`[scheduled] usage sync completed for ${count} keys`);
+  } catch (err) {
+    console.error("[scheduled] usage sync failed:", err);
+  }
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled,
+};

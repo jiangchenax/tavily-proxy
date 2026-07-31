@@ -1,29 +1,106 @@
 /**
  * Key pool management for Tavily API keys stored in Cloudflare KV.
  *
- * KV schema: key = Tavily API key (e.g. "tvly-xxx"), value = remaining credit (number as string).
+ * KV schema: key = Tavily API key (e.g. "tvly-xxx"),
+ * value = JSON string of KeyState (see below).
+ *
+ * Design follows tavily-hikari:
+ * - The request hot path does NOT estimate/deduct credits. Key health comes
+ *   from real upstream signals: HTTP 432 = quota exhausted (skip until next
+ *   UTC month), HTTP 429 = transient cooldown (Retry-After), 401/403 = invalid.
+ * - Keys are selected by least-recently-used (LRU) among healthy keys.
+ * - Tavily /usage is only synced in the background for display purposes.
  */
 
-export interface KeyInfo {
+export type KeyStatus = "active" | "exhausted";
+
+export interface KeyState {
+  status: KeyStatus;
+  /** Unix seconds of the last time this key was picked. LRU ordering key. */
+  lastUsedAt: number;
+  /** Unix seconds when status changed to exhausted. Basis for monthly reset. */
+  statusChangedAt: number;
+  /** Unix seconds until which the key is cooled down (429 Retry-After). */
+  cooldownUntil: number;
+  /** Display-only credit limit, synced in the background. */
+  creditLimit: number;
+  /** Display-only remaining credit, synced in the background. */
+  creditRemaining: number;
+  /** Unix seconds of the last successful /usage sync. */
+  creditSyncedAt: number;
+}
+
+export interface KeyInfo extends KeyState {
   apiKey: string;
-  remainingCredit: number;
+  /** Masked display form, e.g. "tvly-1234...abcd". */
+  mask: string;
+}
+
+const USAGE_BASE = "https://api.tavily.com/usage";
+
+function nowSecs(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function monthStartUtcSecs(now: number): number {
+  const d = new Date(now * 1000);
+  d.setUTCDate(1);
+  d.setUTCHours(0, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
+export function defaultState(): KeyState {
+  return {
+    status: "active",
+    lastUsedAt: 0,
+    statusChangedAt: 0,
+    cooldownUntil: 0,
+    creditLimit: 0,
+    creditRemaining: 0,
+    creditSyncedAt: 0,
+  };
+}
+
+export function maskKey(apiKey: string): string {
+  if (apiKey.length <= 12) return `${apiKey.slice(0, 4)}...`;
+  return `${apiKey.slice(0, 7)}...${apiKey.slice(-4)}`;
+}
+
+function parseState(value: string | null): KeyState {
+  if (!value) return defaultState();
+  try {
+    const raw = JSON.parse(value) as Partial<KeyState>;
+    const base = defaultState();
+    return {
+      ...base,
+      ...raw,
+      status: raw.status === "exhausted" ? "exhausted" : "active",
+    };
+  } catch {
+    // Legacy values were plain numbers (remaining credit). Treat as active.
+    const legacy = Number(value);
+    return { ...defaultState(), creditRemaining: Number.isFinite(legacy) ? Math.max(0, legacy) : 0 };
+  }
+}
+
+function serializeState(state: KeyState): string {
+  return JSON.stringify(state);
 }
 
 /**
  * Query the Tavily /usage endpoint to get remaining credits for a key.
+ * Returns { limit, remaining }; remaining is capped at >= 0.
  */
-export async function queryRemainingCredit(apiKey: string): Promise<number> {
-  const keyPrefix = apiKey.substring(0, 13);
-  const res = await fetch("https://api.tavily.com/usage", {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
+export async function queryUsage(
+  apiKey: string
+): Promise<{ limit: number; remaining: number }> {
+  const res = await fetch(USAGE_BASE, {
+    headers: { Authorization: `Bearer ${apiKey}` },
   });
 
   if (!res.ok) {
     const text = await res.text();
-    console.log(`[usage] key=${keyPrefix}... response=${res.status} ${text}`);
-    throw new Error(`Failed to query usage for key: ${res.status} ${text}`);
+    throw new Error(`Tavily API error ${res.status}: ${text}`);
   }
 
   const data = (await res.json()) as {
@@ -31,63 +108,94 @@ export async function queryRemainingCredit(apiKey: string): Promise<number> {
     account: { plan_limit: number; plan_usage: number };
   };
 
-  console.log(`[usage] key=${keyPrefix}... response=${JSON.stringify(data)}`);
-
-  // remaining = limit - usage. If limit is null (unlimited), report a large number.
-  const limit = data.key.limit ?? data.account.plan_limit;
+  const limit = data.key.limit ?? data.account.plan_limit ?? 0;
   const usage = data.key.usage;
-  return Math.max(0, limit - usage);
+  return { limit, remaining: Math.max(0, limit - usage) };
 }
 
 /**
- * List all keys from KV using cached values (no Tavily API call).
+ * Lazy monthly reset (tavily-hikari reset_monthly): any key marked exhausted
+ * in a previous UTC month is restored to active.
  */
-async function listKeysFromCache(kv: KVNamespace): Promise<KeyInfo[]> {
-  const keys: KeyInfo[] = [];
-  let cursor: string | undefined;
+export async function resetMonthly(kv: KVNamespace): Promise<void> {
+  const now = nowSecs();
+  const monthStart = monthStartUtcSecs(now);
 
-  do {
-    const result = await kv.list({ cursor });
-    for (const key of result.keys) {
-      const value = await kv.get(key.name);
-      keys.push({
-        apiKey: key.name,
-        remainingCredit: value ? Number(value) : 0,
-      });
+  const list = await kv.list();
+  for (const item of list.keys) {
+    const state = parseState(await kv.get(item.name));
+    if (state.status === "exhausted" && state.statusChangedAt > 0 && state.statusChangedAt < monthStart) {
+      state.status = "active";
+      state.statusChangedAt = now;
+      await kv.put(item.name, serializeState(state));
     }
-    cursor = result.list_complete ? undefined : result.cursor;
-  } while (cursor);
-
-  return keys;
+  }
 }
 
 /**
- * List all keys from KV with their remaining credits (reads from cache only).
- */
-export async function listKeys(kv: KVNamespace): Promise<KeyInfo[]> {
-  return listKeysFromCache(kv);
-}
-
-/**
- * Pick a random key from all keys with remaining credit > 0.
- * Returns null if no keys are available.
+ * Pick the least-recently-used healthy key. Returns null if none available.
+ * Resets monthly-exhausted keys lazily before selecting.
  */
 export async function pickBestKey(kv: KVNamespace): Promise<string | null> {
-  const keys = await listKeysFromCache(kv);
-  const candidates = keys.filter(k => k.remainingCredit > 0);
-  if (candidates.length === 0) return null;
+  await resetMonthly(kv);
 
-  const picked = candidates[Math.floor(Math.random() * candidates.length)];
-  return picked.apiKey;
+  const now = nowSecs();
+  let best: { name: string; state: KeyState } | null = null;
+
+  const list = await kv.list();
+  for (const item of list.keys) {
+    const state = parseState(await kv.get(item.name));
+    if (state.status !== "active") continue;
+    if (state.cooldownUntil > now) continue;
+    if (best === null || state.lastUsedAt < best.state.lastUsedAt) {
+      best = { name: item.name, state };
+    }
+  }
+
+  if (!best) return null;
+
+  best.state.lastUsedAt = now;
+  await kv.put(best.name, serializeState(best.state));
+  return best.name;
 }
 
 /**
- * Add or update a key in KV. Queries the Tavily API for current remaining credit.
+ * Mark a key exhausted (HTTP 432 / 401 / 403). It is skipped for the rest of
+ * the current UTC month and auto-recovers on the next monthly reset.
+ */
+export async function markExhausted(kv: KVNamespace, apiKey: string): Promise<void> {
+  const state = parseState(await kv.get(apiKey));
+  state.status = "exhausted";
+  state.statusChangedAt = nowSecs();
+  await kv.put(apiKey, serializeState(state));
+}
+
+/**
+ * Set a transient cooldown (HTTP 429) until the given Unix seconds.
+ */
+export async function setCooldown(kv: KVNamespace, apiKey: string, cooldownUntil: number): Promise<void> {
+  const state = parseState(await kv.get(apiKey));
+  state.cooldownUntil = Math.max(state.cooldownUntil, cooldownUntil);
+  await kv.put(apiKey, serializeState(state));
+}
+
+/**
+ * Add or restore a key in KV. Queries Tavily for current remaining credit.
  */
 export async function addKey(kv: KVNamespace, apiKey: string): Promise<KeyInfo> {
-  const remaining = await queryRemainingCredit(apiKey);
-  await kv.put(apiKey, String(remaining));
-  return { apiKey, remainingCredit: remaining };
+  const { limit, remaining } = await queryUsage(apiKey);
+  const now = nowSecs();
+  const state: KeyState = {
+    status: "active",
+    lastUsedAt: now,
+    statusChangedAt: now,
+    cooldownUntil: 0,
+    creditLimit: limit,
+    creditRemaining: remaining,
+    creditSyncedAt: now,
+  };
+  await kv.put(apiKey, serializeState(state));
+  return { apiKey, mask: maskKey(apiKey), ...state };
 }
 
 /**
@@ -98,39 +206,55 @@ export async function deleteKey(kv: KVNamespace, apiKey: string): Promise<void> 
 }
 
 /**
- * Deduct credit from a key after a request.
- * This is a best-effort local update; we periodically re-sync from the API.
+ * List all keys from KV with their cached state (no Tavily API call).
  */
-export async function deductCredit(kv: KVNamespace, apiKey: string, amount: number): Promise<void> {
-  const current = await kv.get(apiKey);
-  if (current !== null) {
-    const newVal = Math.max(0, Number(current) - amount);
-    await kv.put(apiKey, String(newVal));
-  }
+export async function listKeys(kv: KVNamespace): Promise<KeyInfo[]> {
+  const keys: KeyInfo[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const result = await kv.list({ cursor });
+    for (const item of result.keys) {
+      const state = parseState(await kv.get(item.name));
+      keys.push({ apiKey: item.name, mask: maskKey(item.name), ...state });
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  return keys;
 }
 
 /**
- * Set a key's remaining credit to 0 in KV (e.g. on 401/403 errors).
+ * Sync a single key's usage/credit from Tavily (display fields only).
+ * On HTTP 432 the key is also marked exhausted.
+ * Errors are swallowed so one bad key cannot break the whole sync run.
  */
-export async function invalidateKey(kv: KVNamespace, apiKey: string): Promise<void> {
-  console.log(`[pool] Invalidating key ${apiKey.substring(0, 13)}... (setting credit to -1000)`);
-  await kv.put(apiKey, "-1000");
-}
-
-/**
- * Query the real usage from Tavily and update KV after each MCP tool call.
- */
-export async function maybeSyncKeyUsage(kv: KVNamespace, apiKey: string): Promise<void> {
+export async function syncKeyUsage(kv: KVNamespace, apiKey: string): Promise<void> {
+  const state = parseState(await kv.get(apiKey));
   try {
-    const remaining = await queryRemainingCredit(apiKey);
-    await kv.put(apiKey, String(remaining));
+    const { limit, remaining } = await queryUsage(apiKey);
+    state.creditLimit = limit;
+    state.creditRemaining = remaining;
+    state.creditSyncedAt = nowSecs();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (/429/.test(message)) {
-      console.error(`[sync] Rate limited (429) for key ${apiKey.substring(0, 13)}..., keeping cached value`);
-      return;
+    if (/Tavily API error 432/.test(message)) {
+      state.status = "exhausted";
+      state.statusChangedAt = nowSecs();
     }
-    console.error(`[sync] Failed to sync usage for key ${apiKey.substring(0, 13)}...:`, err);
-    await kv.put(apiKey, "0");
+    // Other failures (429/5xx/network) leave cached values untouched.
   }
+  await kv.put(apiKey, serializeState(state));
+}
+
+/**
+ * Sync usage for all keys. Returns how many keys were updated.
+ * Used by the background scheduled handler and the admin "sync now" action.
+ */
+export async function syncAllUsage(kv: KVNamespace): Promise<number> {
+  const keys = await listKeys(kv);
+  for (const key of keys) {
+    await syncKeyUsage(kv, key.apiKey);
+  }
+  return keys.length;
 }
