@@ -14,13 +14,6 @@ compatibility_flags = ["nodejs_compat"]
 # [triggers]
 # crons = ["*/30 * * * *"]
 
-[[kv_namespaces]]
-binding = "KV"
-id = "11d3afd2a78340ac930675db6a910f32"
-# preview_id must be a real namespace ID when using `wrangler dev --remote`
-# or preview deployments; `wrangler dev` (local) simulates KV regardless.
-# preview_id = "local-dev-kv"
-
 [observability]
 [observability.logs]
 enabled = true
