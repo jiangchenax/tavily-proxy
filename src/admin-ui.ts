@@ -69,18 +69,18 @@ const HTML = `<!doctype html>
   <div class="sub">MCP proxy for Tavily with an API key pool</div>
 
   <div class="card" id="loginCard">
-    <div class="row">
+    <form class="row" onsubmit="login(); return false;">
       <input id="authInput" type="password" placeholder="AUTH_KEY (x-api-key header)" autocomplete="off" />
-      <button onclick="login()">Unlock</button>
-    </div>
+      <button>Unlock</button>
+    </form>
     <div class="msg" id="loginMsg"></div>
   </div>
 
   <div class="card" id="addCard" style="display:none">
-    <div class="row">
+    <form class="row" onsubmit="addKey(); return false;">
       <input id="keyInput" type="text" placeholder="tvly-... new Tavily API key" autocomplete="off" spellcheck="false" />
-      <button onclick="addKey()">Add key</button>
-    </div>
+      <button>Add key</button>
+    </form>
     <div class="msg" id="addMsg"></div>
   </div>
 
@@ -120,6 +120,11 @@ function statusBadge(key) {
     return '<span class="badge cooling">cooling</span>';
   }
   return '<span class="badge ' + key.status + '">' + key.status + "</span>";
+}
+
+function creditBadge(key) {
+  const hasCredit = !(key.status === "exhausted" || key.creditRemaining <= 0);
+  return '<span class="badge ' + (hasCredit ? "active" : "exhausted") + '">' + (hasCredit ? "Available" : "No credit") + "</span>";
 }
 
 function api(path, options) {
@@ -204,7 +209,6 @@ function render(keys) {
   empty.style.display = "none";
   keys.forEach(function (k) {
     const tr = document.createElement("tr");
-    const credit = k.creditRemaining + " / " + k.creditLimit;
     const btn = document.createElement("button");
     btn.className = "danger";
     btn.textContent = "Delete";
@@ -212,7 +216,7 @@ function render(keys) {
     tr.innerHTML =
       '<td><code>' + k.mask + "</code></td>" +
       "<td>" + statusBadge(k) + "</td>" +
-      "<td>" + credit + "</td>" +
+      "<td>" + creditBadge(k) + "</td>" +
       '<td class="muted">' + timeAgo(k.lastUsedAt) + "</td>" +
       '<td class="muted">' + timeAgo(k.creditSyncedAt) + "</td>";
     const td = document.createElement("td");
