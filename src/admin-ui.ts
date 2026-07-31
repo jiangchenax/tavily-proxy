@@ -53,6 +53,7 @@ const CSS = `
   .muted { color: var(--muted); font-size: 12px; }
   .empty { color: var(--muted); text-align: center; padding: 24px 0; }
   .toolbar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+  td.note { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
 
 const HTML = `<!doctype html>
@@ -79,6 +80,7 @@ const HTML = `<!doctype html>
   <div class="card" id="addCard" style="display:none">
     <form class="row" onsubmit="addKey(); return false;">
       <input id="keyInput" type="text" placeholder="tvly-... new Tavily API key" autocomplete="off" spellcheck="false" />
+      <input id="noteInput" type="text" placeholder="Note (optional)" autocomplete="off" spellcheck="false" />
       <button>Add key</button>
     </form>
     <div class="msg" id="addMsg"></div>
@@ -89,7 +91,7 @@ const HTML = `<!doctype html>
       <thead>
         <tr>
           <th>Key</th><th>Status</th><th>Credit</th>
-          <th>Last used</th><th>Synced</th><th></th>
+          <th>Note</th><th>Added</th><th>Last used</th><th>Synced</th><th></th>
         </tr>
       </thead>
       <tbody id="rows"></tbody>
@@ -113,6 +115,17 @@ function timeAgo(secs) {
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
   return Math.floor(diff / 86400) + "d ago";
+}
+
+function formatTime(secs) {
+  if (!secs) return "-";
+  var d = new Date(secs * 1000);
+  function p(n) { return (n < 10 ? "0" : "") + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function statusBadge(key) {
@@ -169,10 +182,12 @@ function login() {
 function addKey() {
   const value = document.getElementById("keyInput").value.trim();
   if (!value) { setMsg("addMsg", "Enter a Tavily API key", true); return; }
-  api("/api/keys", { method: "POST", body: JSON.stringify({ apiKey: value }) })
+  const note = document.getElementById("noteInput").value.trim();
+  api("/api/keys", { method: "POST", body: JSON.stringify({ apiKey: value, note: note }) })
     .then(handle)
     .then(function () {
       document.getElementById("keyInput").value = "";
+      document.getElementById("noteInput").value = "";
       setMsg("addMsg", "Key added");
       return loadKeys();
     })
@@ -217,6 +232,8 @@ function render(keys) {
       '<td><code>' + k.mask + "</code></td>" +
       "<td>" + statusBadge(k) + "</td>" +
       "<td>" + creditBadge(k) + "</td>" +
+      '<td class="note" title="' + escapeHtml(k.note) + '">' + (k.note ? escapeHtml(k.note) : '<span class="muted">\u2013</span>') + "</td>" +
+      '<td class="muted">' + formatTime(k.addedAt) + "</td>" +
       '<td class="muted">' + timeAgo(k.lastUsedAt) + "</td>" +
       '<td class="muted">' + timeAgo(k.creditSyncedAt) + "</td>";
     const td = document.createElement("td");

@@ -22,6 +22,10 @@ export interface KeyState {
   statusChangedAt: number;
   /** Unix seconds until which the key is cooled down (429 Retry-After). */
   cooldownUntil: number;
+  /** Unix seconds when the key was added to the pool. */
+  addedAt: number;
+  /** Short management note set when the key was added. */
+  note: string;
   /** Display-only credit limit, synced in the background. */
   creditLimit: number;
   /** Display-only remaining credit, synced in the background. */
@@ -55,6 +59,8 @@ export function defaultState(): KeyState {
     lastUsedAt: 0,
     statusChangedAt: 0,
     cooldownUntil: 0,
+    addedAt: 0,
+    note: "",
     creditLimit: 0,
     creditRemaining: 0,
     creditSyncedAt: 0,
@@ -181,8 +187,9 @@ export async function setCooldown(kv: KVNamespace, apiKey: string, cooldownUntil
 
 /**
  * Add or restore a key in KV. Queries Tavily for current remaining credit.
+ * The optional `note` is a short management comment shown in the admin panel.
  */
-export async function addKey(kv: KVNamespace, apiKey: string): Promise<KeyInfo> {
+export async function addKey(kv: KVNamespace, apiKey: string, note = ""): Promise<KeyInfo> {
   const { limit, remaining } = await queryUsage(apiKey);
   const now = nowSecs();
   const state: KeyState = {
@@ -190,6 +197,8 @@ export async function addKey(kv: KVNamespace, apiKey: string): Promise<KeyInfo> 
     lastUsedAt: now,
     statusChangedAt: now,
     cooldownUntil: 0,
+    addedAt: now,
+    note: note.trim().slice(0, 200),
     creditLimit: limit,
     creditRemaining: remaining,
     creditSyncedAt: now,

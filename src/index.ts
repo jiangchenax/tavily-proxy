@@ -431,11 +431,11 @@ app.delete("/mcp", async (c) => {
 // Add a key (queries Tavily for remaining credit, inserts/updates KV)
 app.post("/api/keys", async (c) => {
   try {
-    const body = await c.req.json<{ apiKey: string }>();
+    const body = await c.req.json<{ apiKey: string; note?: string }>();
     if (!body.apiKey) {
       return c.json({ error: "Missing 'apiKey' in request body" }, 400);
     }
-    const info = await addKey(c.env.KV, body.apiKey);
+    const info = await addKey(c.env.KV, body.apiKey, body.note);
     return c.json({ success: true, key: info });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
