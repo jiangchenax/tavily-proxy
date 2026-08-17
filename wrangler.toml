@@ -18,3 +18,7 @@ compatibility_flags = ["nodejs_compat"]
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+[[kv_namespaces]]
+binding = "KV"
+d2eb69a0fb514ce8bf33a0ad4057ab04
